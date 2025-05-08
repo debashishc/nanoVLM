@@ -21,105 +21,94 @@ class VisionLanguageModel(nn.Module):
         token_embd = self.decoder.token_embedding(input_ids)
 
         combined_embd = torch.cat((image_embd, token_embd), dim=1) # Concatenate image embeddings to token embeddings
-        
+
         # Adjust attention mask to account for image tokens
         if attention_mask is not None:
             # Create mask of 1s for image tokens (all image tokens should be attended to)
             batch_size = image_embd.size(0)
             img_seq_len = image_embd.size(1)
             image_attention_mask = torch.ones((batch_size, img_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
-            
+
             # Combine image and token attention masks
             attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
 
-        logits = self.decoder(combined_embd, attention_mask) # Not logits yet, but easier to return like this
+        # Pass combined_embd to the decoder. 
+        # If lm_use_tokens is False (VLM default), decoder's forward returns normalized hidden states.
+        # If lm_use_tokens is True, decoder's forward returns logits.
+        output_from_decoder = self.decoder(combined_embd, attention_mask=attention_mask, use_cache=False) 
 
         loss = None
         if targets is not None:
-            # Only use the token part of the logits for loss computation
-            logits = self.decoder.head(logits)
-            logits = logits[:, image_embd.size(1):, :]
+            logits = output_from_decoder
+            if not self.decoder.lm_use_tokens: # Apply head if decoder outputted hidden states
+                logits = self.decoder.head(logits)
+            
+            logits = logits[:, image_embd.size(1):, :] # Use only token part for loss
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
-
-        return logits, loss
+        
+        return output_from_decoder, loss
 
     @torch.no_grad()
     def generate(self, input_ids, image, attention_mask=None, max_new_tokens=5):
-        # Process image through vision encoder and projection
+        # Process image and initial text tokens
         image_embd = self.vision_encoder(image)
         image_embd = self.MP(image_embd)
-        
-        # Embed initial tokens
         token_embd = self.decoder.token_embedding(input_ids)
-        
-        # Concatenate image embeddings with token embeddings
-        combined_embd = torch.cat((image_embd, token_embd), dim=1)
+        initial_embeddings = torch.cat((image_embd, token_embd), dim=1)
 
-        batch_size = image_embd.size(0)
-        img_seq_len = image_embd.size(1)
+        batch_size = initial_embeddings.size(0)
+        prompt_len = initial_embeddings.size(1)
         
-        # Adjust attention mask to account for image tokens
+        # Prepare attention mask for the initial prompt processing
+        prompt_attention_mask = None
         if attention_mask is not None:
-            # Create mask of 1s for image tokens (all image tokens should be attended to)
-            image_attention_mask = torch.ones((batch_size, img_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
-            attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
-        
-        # Initialize KV cache for each block in the decoder
+            image_attention_mask = torch.ones((batch_size, image_embd.size(1)), device=attention_mask.device, dtype=attention_mask.dtype)
+            prompt_attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
+
+        # KV cache initialization
         kv_caches = [None] * len(self.decoder.blocks)
+        prompt_pos_ids = torch.arange(prompt_len, device=initial_embeddings.device).unsqueeze(0).expand(batch_size, -1)
+        prompt_cos, prompt_sin = self.decoder.rotary_embd(prompt_pos_ids)
         
-        # Process the initial sequence to populate the KV cache
-        position_ids = torch.arange(combined_embd.size(1), device=combined_embd.device).unsqueeze(0).expand(batch_size, -1)
-        cos, sin = self.decoder.rotary_embd(position_ids)
-        
-        # Forward pass through each block to initialize the KV cache
-        current_outputs = combined_embd
-        for i, block in enumerate(self.decoder.blocks):
-            current_outputs, kv_caches[i] = block(current_outputs, cos, sin, attention_mask, None, True)
-        
-        current_outputs = self.decoder.norm(current_outputs)
-        
-        # Generate tokens using the cached KV values
-        generated_tokens = torch.zeros((batch_size, max_new_tokens), device=input_ids.device, dtype=input_ids.dtype)
-        
-        seq_len = combined_embd.size(1)
-        
-        for i in range(max_new_tokens):
-            # Get the last token's position for rotary embeddings
-            position_id = torch.full((batch_size, 1), seq_len + i, device=combined_embd.device)
-            cos, sin = self.decoder.rotary_embd(position_id)
-            
-            # Only process the last token with cached KV values
-            last_token = current_outputs[:, -1:, :]
-            
-            # Forward pass through each block, using and updating the KV cache
-            for j, block in enumerate(self.decoder.blocks):
-                last_token, kv_caches[j] = block(last_token, cos, sin, None, kv_caches[j], True)
-            
-            # Apply the final normalization
-            last_token = self.decoder.norm(last_token)
-            
-            # Convert to logits if needed
-            if not self.decoder.lm_use_tokens:
-                last_token_logits = self.decoder.head(last_token)
+        hidden_states = initial_embeddings
+        for i, block_module in enumerate(self.decoder.blocks):
+            hidden_states, kv_caches[i] = block_module(hidden_states, prompt_cos, prompt_sin, prompt_attention_mask, None, True)
+        prompt_final_hidden_state_normed = self.decoder.norm(hidden_states[:, -1, :]) # H_prompt_last_normed
+
+        # Autoregressive generation loop
+        generated_tokens_ids = torch.zeros((batch_size, max_new_tokens), device=input_ids.device, dtype=input_ids.dtype)
+        next_token_embeddings = None # Stores E_k for generating token k+1
+
+        for k in range(max_new_tokens): # k: index of the new token being generated
+            if k == 0:
+                # First token: logits from H_prompt_last_normed
+                current_logits = self.decoder.head(prompt_final_hidden_state_normed)
+                # cfg.lm_use_tokens is False for VLM, so head is applied here.
             else:
-                last_token_logits = last_token
-
-            probs = torch.softmax(last_token_logits.squeeze(1), dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+                # Subsequent tokens: process E_(k-1) (embedding of previously generated token)
+                current_input_for_blocks = next_token_embeddings # E_(k-1) [B, 1, C]
                 
-            generated_tokens[:, i] = next_token.squeeze(-1)
-            
-            # Get the embedding for the next token and append to current outputs for the next iteration
-            next_embd = self.decoder.token_embedding(next_token)
-            current_outputs = torch.cat([current_outputs, next_embd], dim=1)
-            
-            # If we had attention mask, we need to extend it for the new token
-            if attention_mask is not None:
-                attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)), dim=1)
-        
-        return generated_tokens
-       
+                # RoPE for E_(k-1) at its absolute position (prompt_len + k - 1)
+                pos_ids_for_input_token = torch.tensor([[prompt_len + k - 1]], device=initial_embeddings.device).expand(batch_size, -1)
+                cos_current, sin_current = self.decoder.rotary_embd(pos_ids_for_input_token)
+                
+                hidden_output_current_step = current_input_for_blocks
+                for i_block, block_module in enumerate(self.decoder.blocks):
+                    hidden_output_current_step, kv_caches[i_block] = block_module(hidden_output_current_step, cos_current, sin_current, None, kv_caches[i_block], True)
+                
+                current_new_token_hidden_normed = self.decoder.norm(hidden_output_current_step) # H_k_normed [B, 1, C]
+                current_logits = self.decoder.head(current_new_token_hidden_normed.squeeze(1)) # Squeeze to [B, C] for head
 
+            # Sample token_k
+            probs = F.softmax(current_logits, dim=-1)
+            sampled_token_k_ids = torch.multinomial(probs, num_samples=1) # [B, 1]
+            generated_tokens_ids[:, k] = sampled_token_k_ids.squeeze(-1)
+            
+            # Prepare E_k for the next iteration
+            next_token_embeddings = self.decoder.token_embedding(sampled_token_k_ids) # E_k [B, 1, C]
+            
+        return generated_tokens_ids
+        
     def load_checkpoint(self, path):
         print(f"Loading weights from full VLM checkpoint: {path}")
         checkpoint = torch.load(path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))        
