@@ -92,8 +92,6 @@ class VisionLanguageModel(nn.Module):
             last_token = current_outputs[:, -1:, :]
             
             # Forward pass through each block, using and updating the KV cache
-            # We don't need to pass attention_mask for generation steps as each new token
-            # only needs to attend to the past tokens (which is handled by is_causal=True)
             for j, block in enumerate(self.decoder.blocks):
                 last_token, kv_caches[j] = block(last_token, cos, sin, None, kv_caches[j], True)
             
@@ -115,8 +113,9 @@ class VisionLanguageModel(nn.Module):
             next_embd = self.decoder.token_embedding(next_token)
             current_outputs = torch.cat([current_outputs, next_embd], dim=1)
             
-            # We no longer need to extend the attention mask for each new token in generation
-            # since we're now using is_causal=True without an explicit attention mask
+            # If we had attention mask, we need to extend it for the new token
+            if attention_mask is not None:
+                attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)), dim=1)
         
         return generated_tokens
        
