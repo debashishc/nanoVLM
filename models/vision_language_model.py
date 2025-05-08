@@ -57,43 +57,70 @@ class VisionLanguageModel(nn.Module):
 
         batch_size = image_embd.size(0)
         img_seq_len = image_embd.size(1)
+        
         # Adjust attention mask to account for image tokens
         if attention_mask is not None:
             # Create mask of 1s for image tokens (all image tokens should be attended to)
             image_attention_mask = torch.ones((batch_size, img_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
             attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
         
-        # Generate from combined embeddings using the decoder
-        # We need to use the decoder's forward function and not its generate method
-        # because we want to keep track of the image prefix
-        outputs = combined_embd
+        # Initialize KV cache for each block in the decoder
+        kv_caches = [None] * len(self.decoder.blocks)
+        
+        # Process the initial sequence to populate the KV cache
+        position_ids = torch.arange(combined_embd.size(1), device=combined_embd.device).unsqueeze(0).expand(batch_size, -1)
+        cos, sin = self.decoder.rotary_embd(position_ids)
+        
+        # Forward pass through each block to initialize the KV cache
+        current_outputs = combined_embd
+        for i, block in enumerate(self.decoder.blocks):
+            current_outputs, kv_caches[i] = block(current_outputs, cos, sin, attention_mask, None, True)
+        
+        current_outputs = self.decoder.norm(current_outputs)
+        
+        # Generate tokens using the cached KV values
         generated_tokens = torch.zeros((batch_size, max_new_tokens), device=input_ids.device, dtype=input_ids.dtype)
         
-        #Note: Here you could implement improvements like e.g. KV caching
+        seq_len = combined_embd.size(1)
+        
         for i in range(max_new_tokens):
-            model_out = self.decoder(outputs, attention_mask)
+            # Get the last token's position for rotary embeddings
+            position_id = torch.full((batch_size, 1), seq_len + i, device=combined_embd.device)
+            cos, sin = self.decoder.rotary_embd(position_id)
             
-            # Get predictions for the last token only (normally this is the embedding, not the logits)
-            last_token_logits = model_out[:, -1, :]
+            # Only process the last token with cached KV values
+            last_token = current_outputs[:, -1:, :]
             
-            # Apply head to get logits (if model is in embedding mode)
+            # Forward pass through each block, using and updating the KV cache
+            # We don't need to pass attention_mask for generation steps as each new token
+            # only needs to attend to the past tokens (which is handled by is_causal=True)
+            for j, block in enumerate(self.decoder.blocks):
+                last_token, kv_caches[j] = block(last_token, cos, sin, None, kv_caches[j], True)
+            
+            # Apply the final normalization
+            last_token = self.decoder.norm(last_token)
+            
+            # Convert to logits if needed
             if not self.decoder.lm_use_tokens:
-                last_token_logits = self.decoder.head(last_token_logits)
+                last_token_logits = self.decoder.head(last_token)
+            else:
+                last_token_logits = last_token
 
-            probs = torch.softmax(last_token_logits, dim=-1)
+            probs = torch.softmax(last_token_logits.squeeze(1), dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
                 
             generated_tokens[:, i] = next_token.squeeze(-1)
             
-            # Convert to embedding and append
+            # Get the embedding for the next token and append to current outputs for the next iteration
             next_embd = self.decoder.token_embedding(next_token)
-            outputs = torch.cat((outputs, next_embd), dim=1)
-
-            if attention_mask is not None:
-                attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)), dim=1)
+            current_outputs = torch.cat([current_outputs, next_embd], dim=1)
+            
+            # We no longer need to extend the attention mask for each new token in generation
+            # since we're now using is_causal=True without an explicit attention mask
         
         return generated_tokens
-        
+       
+
     def load_checkpoint(self, path):
         print(f"Loading weights from full VLM checkpoint: {path}")
         checkpoint = torch.load(path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))        
